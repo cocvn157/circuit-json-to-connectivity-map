@@ -22,6 +22,7 @@ import { getWireSegmentPolygon } from "./getWireSegmentPolygon"
 import { ConnectivityMap } from "./ConnectivityMap"
 import { doesLineIntersectLine } from "@tscircuit/math-utils"
 import { findConnectedNetworks } from "./findConnectedNetworks"
+import { projectCopperConductorComponents } from "./projectCopperConductorComponents"
 
 // Match the pour solver's coordinate scale. Flatten's internal epsilon must
 // not collapse the sub-micron edges emitted by polygon clipping into points.
@@ -80,6 +81,11 @@ interface CopperConductorGeometry extends CopperConductor {
   polygon: Polygon
 }
 
+interface CopperAnalysis {
+  components: CopperConductorGeometry[][]
+  analyzedTraceIds: Set<string>
+}
+
 /**
  * A PCB Connectivity Map is a connectivity map that has analyzed what traces and ports are actually connected on the
  * PCB.
@@ -92,8 +98,7 @@ export class PcbConnectivityMap {
   traceIdToElm: Map<string, PCBTrace>
   portIdToElm: Map<string, PCBPort>
   connMap: ConnectivityMap
-  private copperConductorComponents?: CopperConductorGeometry[][]
-  private disconnectedTraceIds = new Set<string>()
+  private copperAnalysis?: CopperAnalysis
 
   constructor(circuitJson?: AnyCircuitElement[]) {
     this.circuitJson = circuitJson || []
@@ -126,11 +131,17 @@ export class PcbConnectivityMap {
 
   private _buildTraceConnectivityMap(): ConnectivityMap {
     const connections: string[][] = []
-    const { connections: copperConnections, disconnectedTraceIds } =
-      this._getCopperConnectivity()
-    this.disconnectedTraceIds = disconnectedTraceIds
+    const { components, analyzedTraceIds } = this._getCopperAnalysis()
+    const { connections: copperConnections, ownedIds } =
+      projectCopperConductorComponents(
+        components,
+        analyzedTraceIds,
+        this.traceIdToElm,
+      )
+    // Copper components are authoritative for the IDs they own. The legacy
+    // trace-only model applies exclusively outside that analysis.
     const traceIds = Array.from(this.traceIdToElm.keys()).filter(
-      (id) => !disconnectedTraceIds.has(id),
+      (id) => !ownedIds.has(id),
     )
     // Keep geometry local to this build so trace edits cannot reuse old polygons.
     const segmentPolygons: TraceSegmentPolygonCache = new Map()
@@ -151,10 +162,10 @@ export class PcbConnectivityMap {
       const trace = this.traceIdToElm.get(traceId)!
       for (const rp of trace.route) {
         if (rp.route_type === "wire") {
-          if (rp.start_pcb_port_id) {
+          if (rp.start_pcb_port_id && !ownedIds.has(rp.start_pcb_port_id)) {
             connections.push([rp.start_pcb_port_id, traceId])
           }
-          if (rp.end_pcb_port_id) {
+          if (rp.end_pcb_port_id && !ownedIds.has(rp.end_pcb_port_id)) {
             connections.push([traceId, rp.end_pcb_port_id])
           }
         }
@@ -176,38 +187,33 @@ export class PcbConnectivityMap {
       ),
       trace,
     ]
-    this.copperConductorComponents = undefined
-    if (isReplacement) {
-      this.connMap = this._buildTraceConnectivityMap()
-      return
-    }
-
-    const { connections: copperConnections, disconnectedTraceIds } =
-      this._getCopperConnectivity()
-    // Adding copper can change an existing trace's net eligibility or repair
-    // its physical continuity. Remove or restore its earlier links accordingly.
+    this.copperAnalysis = undefined
+    // Copper edits can split or merge components and change logical eligibility.
+    // Re-project the complete analysis instead of retaining whole-trace edges.
     if (
-      disconnectedTraceIds.size !== this.disconnectedTraceIds.size ||
-      [...disconnectedTraceIds].some((id) => !this.disconnectedTraceIds.has(id))
+      isReplacement ||
+      this.circuitJson.some(
+        (element) =>
+          element.type === "pcb_copper_pour" && element.source_net_id,
+      )
     ) {
       this.connMap = this._buildTraceConnectivityMap()
       return
     }
+
+    // Preserve the lightweight trace-only path for circuits without assigned pours.
     const connections: string[][] = []
-    if (!disconnectedTraceIds.has(trace.pcb_trace_id)) {
-      for (const rp of trace.route) {
-        if (rp.route_type === "wire") {
-          if (rp.start_pcb_port_id) {
-            connections.push([rp.start_pcb_port_id, trace.pcb_trace_id])
-          }
-          if (rp.end_pcb_port_id) {
-            connections.push([rp.end_pcb_port_id, trace.pcb_trace_id])
-          }
+    for (const rp of trace.route) {
+      if (rp.route_type === "wire") {
+        if (rp.start_pcb_port_id) {
+          connections.push([rp.start_pcb_port_id, trace.pcb_trace_id])
+        }
+        if (rp.end_pcb_port_id) {
+          connections.push([rp.end_pcb_port_id, trace.pcb_trace_id])
         }
       }
     }
-
-    this.connMap.addConnections([...connections, ...copperConnections])
+    this.connMap.addConnections(connections)
   }
 
   _arePcbTracesConnected(trace1: PCBTrace, trace2: PCBTrace): boolean {
@@ -336,12 +342,13 @@ export class PcbConnectivityMap {
   /** Same-net copper groups, including pour, via, and terminal IDs.
    * Polygon geometry remains internal. Generated stitching vias still conduct
    * copper, but callers can exclude them from authored terminal anchors.
+   * A trace ID may occur in multiple physical components. Such an ID stays in
+   * this metadata but has no single network in connMap or the trace queries.
    */
   getCopperConductorComponents(
     generatedStitchingViaIds: ReadonlySet<string> = new Set(),
   ): CopperConductor[][] {
-    this.copperConductorComponents ??= this._buildCopperConductorComponents()
-    return this.copperConductorComponents.map((conductors) =>
+    return this._getCopperAnalysis().components.map((conductors) =>
       conductors.map(({ polygon, ...conductor }) => ({
         ...conductor,
         isTerminal:
@@ -351,32 +358,8 @@ export class PcbConnectivityMap {
     )
   }
 
-  private _getCopperConnectivity() {
-    const components = this.getCopperConductorComponents()
-    const seenTraceIds = new Set<string>()
-    const disconnectedTraceIds = new Set<string>()
-    for (const conductors of components) {
-      const traceIds = new Set(
-        conductors.flatMap((c) => (c.traceId ? [c.traceId] : [])),
-      )
-      for (const traceId of traceIds) {
-        if (seenTraceIds.has(traceId)) disconnectedTraceIds.add(traceId)
-        seenTraceIds.add(traceId)
-      }
-    }
-    const connections = components
-      .map((conductors) =>
-        conductors.flatMap((conductor) => [
-          ...(conductor.pcbPortIds ?? []),
-          ...(conductor.pourId ? [conductor.pourId] : []),
-          ...(conductor.viaId ? [conductor.viaId] : []),
-          ...(conductor.traceId && !disconnectedTraceIds.has(conductor.traceId)
-            ? [conductor.traceId]
-            : []),
-        ]),
-      )
-      .filter((ids) => ids.length > 0)
-    return { connections, disconnectedTraceIds }
+  private _getCopperAnalysis(): CopperAnalysis {
+    return (this.copperAnalysis ??= this._buildCopperAnalysis())
   }
 
   /** Physical contacts use board-world points in mm (+X right, +Y up,
@@ -384,10 +367,11 @@ export class PcbConnectivityMap {
    * Net membership only permits a contact; it never creates a physical edge.
    * Trace segments remain separate, and only plated barrels bridge layers.
    */
-  private _buildCopperConductorComponents(): CopperConductorGeometry[][] {
+  private _buildCopperAnalysis(): CopperAnalysis {
     const circuitJson = this.circuitJson
     const pours = circuitJson.filter((e) => e.type === "pcb_copper_pour")
-    if (pours.length === 0) return []
+    const analyzedTraceIds = new Set<string>()
+    if (pours.length === 0) return { components: [], analyzedTraceIds }
     const connectivity = getFullConnectivityMapFromCircuitJson(circuitJson)
     const pouredNets = new Set(
       pours.flatMap((pour) =>
@@ -479,6 +463,9 @@ export class PcbConnectivityMap {
       } else if (element.type === "pcb_trace") {
         const netId = connectivity.getNetConnectedToId(element.pcb_trace_id)
         if (!netId || !pouredNets.has(netId)) continue
+        // Eligibility, not emitted geometry, determines ownership. A trace with
+        // no conducting segments must not fall back to endpoint-only edges.
+        analyzedTraceIds.add(element.pcb_trace_id)
         for (let i = 0; i < element.route.length; i++) {
           const routePoint = element.route[i]!
           if (routePoint.route_type === "via") {
@@ -551,7 +538,7 @@ export class PcbConnectivityMap {
       }
     }
 
-    if (conductors.length === 0) return []
+    if (conductors.length === 0) return { components: [], analyzedTraceIds }
     const parent = conductors.map((_, i) => i)
     const find = (i: number): number => {
       while (parent[i] !== i) {
@@ -597,7 +584,7 @@ export class PcbConnectivityMap {
       if (connectedConductors) connectedConductors.push(conductor)
       else conductorsByRoot.set(root, [conductor])
     }
-    return [...conductorsByRoot.values()]
+    return { components: [...conductorsByRoot.values()], analyzedTraceIds }
   }
 
   private _getRouteEndpoint(

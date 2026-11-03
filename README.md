@@ -105,6 +105,36 @@ A class representing the connectivity map with methods:
 - `getIdsConnectedToNet(netId: string): string[]`
 - `getNetConnectedToId(id: string): string | undefined`
 
+### `PcbConnectivityMap`
+
+`new PcbConnectivityMap(circuitJson)` analyzes physical copper on logical nets
+with assigned copper pours. Same-net contacts on compatible layers determine
+the components used by `connMap`, `areTracesConnected`,
+`getAllTracesConnectedToTrace`, and `getAllTracesConnectedToPort`. Logical net
+membership permits a physical contact; it does not itself connect copper.
+Trace-only connectivity remains available outside this analysis and cannot
+join the components owned by copper analysis.
+
+`getCopperConductorComponents(generatedStitchingViaIds?)` returns those components
+with pour, trace, via, port, layer, and terminal metadata. Geometry stays private.
+Generated stitching vias still conduct but can be excluded from terminal anchors.
+
+The flat connectivity API can assign an ID to only one component:
+
+- A trace ID belongs to the component containing all of its conducting geometry.
+  When its geometry spans disconnected components, the ID remains in each
+  component's metadata but has no network in `connMap`. Trace queries omit it.
+  A physical bridge can reunite the components and restore the trace ID.
+- The same rule applies to port IDs shared by disconnected pads or vias.
+- A port's copper geometry takes precedence over trace endpoint references.
+  References without copper geometry act as aliases only when they identify
+  one unambiguous component; they cannot merge separate components.
+- An analyzed trace with no conducting geometry has no physical network.
+
+`addTrace(trace)` adds or replaces a trace without mutating the input Circuit
+JSON array. With assigned pours, it rebuilds the physical analysis and its ID
+projection, removing stale connections when a bridge or alias changes.
+
 ## Development
 
 This project uses [Bun](https://bun.sh) as its JavaScript runtime.
