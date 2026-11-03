@@ -5,6 +5,7 @@ import type {
   PCBTrace,
   LayerRef,
   PcbTraceRoutePoint,
+  PcbTraceRoutePointWire,
 } from "circuit-json"
 import Flatbush from "flatbush"
 import {
@@ -26,6 +27,44 @@ import { findConnectedNetworks } from "./findConnectedNetworks"
 // not collapse the sub-micron edges emitted by polygon clipping into points.
 const GEOMETRY_SCALE = 1e6
 const CONTACT_TOLERANCE = 1e-7 * GEOMETRY_SCALE
+
+type TraceSegmentPolygonCache = Map<PCBTrace, Map<number, Polygon>>
+
+const getMaxWireSegmentWidth = (
+  trace: PCBTrace,
+  start: PcbTraceRoutePointWire,
+  end: PcbTraceRoutePointWire,
+) => {
+  const endWidth =
+    trace.route_thickness_mode === "interpolated" ? end.width : start.width
+  return start.width_interpolation_mode
+    ? Math.max(start.start_width ?? start.width, start.end_width ?? endWidth)
+    : Math.max(start.width, endWidth)
+}
+
+const getCachedWirePolygon = (
+  cache: TraceSegmentPolygonCache,
+  trace: PCBTrace,
+  index: number,
+  start: PcbTraceRoutePointWire,
+  end: PcbTraceRoutePointWire,
+): Polygon => {
+  let segments = cache.get(trace)
+  if (!segments) {
+    segments = new Map()
+    cache.set(trace, segments)
+  }
+  let polygon = segments.get(index)
+  if (!polygon) {
+    polygon = getWireSegmentPolygon(
+      start,
+      end,
+      trace.route_thickness_mode === "interpolated" ? end.width : start.width,
+    ).scale(GEOMETRY_SCALE, GEOMETRY_SCALE)
+    segments.set(index, polygon)
+  }
+  return polygon
+}
 
 export interface CopperConductor {
   layers: LayerRef[]
@@ -54,6 +93,7 @@ export class PcbConnectivityMap {
   portIdToElm: Map<string, PCBPort>
   connMap: ConnectivityMap
   private copperConductorComponents?: CopperConductorGeometry[][]
+  private disconnectedTraceIds = new Set<string>()
 
   constructor(circuitJson?: AnyCircuitElement[]) {
     this.circuitJson = circuitJson || []
@@ -88,15 +128,20 @@ export class PcbConnectivityMap {
     const connections: string[][] = []
     const { connections: copperConnections, disconnectedTraceIds } =
       this._getCopperConnectivity()
+    this.disconnectedTraceIds = disconnectedTraceIds
     const traceIds = Array.from(this.traceIdToElm.keys()).filter(
       (id) => !disconnectedTraceIds.has(id),
     )
+    // Keep geometry local to this build so trace edits cannot reuse old polygons.
+    const segmentPolygons: TraceSegmentPolygonCache = new Map()
 
     for (let i = 0; i < traceIds.length; i++) {
       for (let j = i + 1; j < traceIds.length; j++) {
         const trace1 = this.traceIdToElm.get(traceIds[i])!
         const trace2 = this.traceIdToElm.get(traceIds[j])!
-        if (this._arePcbTracesConnected(trace1, trace2)) {
+        if (
+          this._arePcbTracesConnectedWithCache(trace1, trace2, segmentPolygons)
+        ) {
           connections.push([traceIds[i], traceIds[j]])
         }
       }
@@ -139,6 +184,15 @@ export class PcbConnectivityMap {
 
     const { connections: copperConnections, disconnectedTraceIds } =
       this._getCopperConnectivity()
+    // Adding copper can change an existing trace's net eligibility or repair
+    // its physical continuity. Remove or restore its earlier links accordingly.
+    if (
+      disconnectedTraceIds.size !== this.disconnectedTraceIds.size ||
+      [...disconnectedTraceIds].some((id) => !this.disconnectedTraceIds.has(id))
+    ) {
+      this.connMap = this._buildTraceConnectivityMap()
+      return
+    }
     const connections: string[][] = []
     if (!disconnectedTraceIds.has(trace.pcb_trace_id)) {
       for (const rp of trace.route) {
@@ -157,6 +211,14 @@ export class PcbConnectivityMap {
   }
 
   _arePcbTracesConnected(trace1: PCBTrace, trace2: PCBTrace): boolean {
+    return this._arePcbTracesConnectedWithCache(trace1, trace2, new Map())
+  }
+
+  private _arePcbTracesConnectedWithCache(
+    trace1: PCBTrace,
+    trace2: PCBTrace,
+    segmentPolygons: TraceSegmentPolygonCache,
+  ): boolean {
     for (let i = 0; i < trace1.route.length - 1; i++) {
       const segment1A = trace1.route[i]
       const segment1B = trace1.route[i + 1]
@@ -181,46 +243,52 @@ export class PcbConnectivityMap {
         if (segment2A.layer !== segment2B.layer) continue
         if (segment1A.layer !== segment2A.layer) continue
 
-        // The legacy constant-width predicate cannot represent explicit tapers.
-        if (
-          segment1A.width_interpolation_mode ||
-          segment2A.width_interpolation_mode
-        ) {
-          const polygon1 = getWireSegmentPolygon(
-            segment1A,
-            segment1B,
-            trace1.route_thickness_mode === "interpolated"
-              ? segment1B.width
-              : segment1A.width,
-          ).scale(GEOMETRY_SCALE, GEOMETRY_SCALE)
-          const polygon2 = getWireSegmentPolygon(
-            segment2A,
-            segment2B,
-            trace2.route_thickness_mode === "interpolated"
-              ? segment2B.width
-              : segment2A.width,
-          ).scale(GEOMETRY_SCALE, GEOMETRY_SCALE)
-          if (copperPolygonsTouch(polygon1, polygon2, CONTACT_TOLERANCE))
-            return true
-          continue
-        }
-
-        // Reject distant pairs before the unchanged continuous predicate.
+        const hasTaper =
+          !!segment1A.width_interpolation_mode ||
+          !!segment2A.width_interpolation_mode
         const lineThickness = (segment1A.width + segment2A.width) / 2
-        const expansion = Math.max(0, lineThickness) + 1e-9
+        // Include both segments' widest ends before rejecting distant pairs.
+        // No polygon geometry is needed until these conservative bounds overlap.
+        const expansion = hasTaper
+          ? (getMaxWireSegmentWidth(trace1, segment1A, segment1B) +
+              getMaxWireSegmentWidth(trace2, segment2A, segment2B)) /
+              2 +
+            CONTACT_TOLERANCE / GEOMETRY_SCALE
+          : Math.max(0, lineThickness) + 1e-9
         if (
           finiteBounds &&
           Number.isFinite(segment2A.x) &&
           Number.isFinite(segment2A.y) &&
           Number.isFinite(segment2B.x) &&
           Number.isFinite(segment2B.y) &&
-          Number.isFinite(lineThickness) &&
+          Number.isFinite(expansion) &&
           (Math.min(segment2A.x, segment2B.x) > maxX + expansion ||
             Math.max(segment2A.x, segment2B.x) < minX - expansion ||
             Math.min(segment2A.y, segment2B.y) > maxY + expansion ||
             Math.max(segment2A.y, segment2B.y) < minY - expansion)
         )
           continue
+
+        // The legacy constant-width predicate cannot represent explicit tapers.
+        if (hasTaper) {
+          const polygon1 = getCachedWirePolygon(
+            segmentPolygons,
+            trace1,
+            i,
+            segment1A,
+            segment1B,
+          )
+          const polygon2 = getCachedWirePolygon(
+            segmentPolygons,
+            trace2,
+            j,
+            segment2A,
+            segment2B,
+          )
+          if (copperPolygonsTouch(polygon1, polygon2, CONTACT_TOLERANCE))
+            return true
+          continue
+        }
 
         // Check if lines are overlapping
         const isOverlapping = doesLineIntersectLine(
