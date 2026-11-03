@@ -243,13 +243,15 @@ export class PcbConnectivityMap {
         if (segment2A.layer !== segment2B.layer) continue
         if (segment1A.layer !== segment2A.layer) continue
 
-        const hasTaper =
+        const hasVariableWidth =
           !!segment1A.width_interpolation_mode ||
-          !!segment2A.width_interpolation_mode
+          !!segment2A.width_interpolation_mode ||
+          trace1.route_thickness_mode === "interpolated" ||
+          trace2.route_thickness_mode === "interpolated"
         const lineThickness = (segment1A.width + segment2A.width) / 2
         // Include both segments' widest ends before rejecting distant pairs.
         // No polygon geometry is needed until these conservative bounds overlap.
-        const expansion = hasTaper
+        const expansion = hasVariableWidth
           ? (getMaxWireSegmentWidth(trace1, segment1A, segment1B) +
               getMaxWireSegmentWidth(trace2, segment2A, segment2B)) /
               2 +
@@ -269,8 +271,9 @@ export class PcbConnectivityMap {
         )
           continue
 
-        // The legacy constant-width predicate cannot represent explicit tapers.
-        if (hasTaper) {
+        // Use the same width geometry as copper components for interpolated
+        // routes and explicit wire profiles; neither is a constant-width line.
+        if (hasVariableWidth) {
           const polygon1 = getCachedWirePolygon(
             segmentPolygons,
             trace1,
