@@ -1,6 +1,21 @@
 import { test, expect } from "bun:test"
 import { ConnectivityMap } from "../src/ConnectivityMap"
 
+test("new networks preserve sparse IDs and merged aliases", () => {
+  const map = new ConnectivityMap({
+    connectivity_net0: ["A"],
+    connectivity_net2: ["B"],
+    connectivity_net3: ["C"],
+  })
+  map.addConnections([["A", "B"], ["D"], ["E"]])
+  expect(map.areIdsConnected("A", "B")).toBe(true)
+  expect(map.getIdsConnectedToNet("connectivity_net2")).toEqual(["A", "B"])
+  expect(map.getIdsConnectedToNet("connectivity_net3")).toEqual(["C"])
+  expect(map.areIdsConnected("C", "D")).toBe(false)
+  expect(map.areIdsConnected("D", "E")).toBe(false)
+  expect(map.getIdsConnectedToNet(map.getNetConnectedToId("D")!)).toEqual(["D"])
+})
+
 test("ConnectivityMap.addConnections should merge existing nets correctly", () => {
   const initialNetMap = {
     net1: ["A", "B"],

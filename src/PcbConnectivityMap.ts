@@ -16,7 +16,8 @@ import {
   getViaPolygon,
 } from "@tscircuit/circuit-json-util"
 import { getFullConnectivityMapFromCircuitJson } from "./getFullConnectivityMapFromCircuitJson"
-import { getViaSpanLayers } from "./getViaSpanLayers"
+import { getPcbViaSpanLayers, getViaSpanLayers } from "./getViaSpanLayers"
+import { getWireSegmentPolygon } from "./getWireSegmentPolygon"
 import { ConnectivityMap } from "./ConnectivityMap"
 import { doesLineIntersectLine } from "@tscircuit/math-utils"
 import { findConnectedNetworks } from "./findConnectedNetworks"
@@ -180,6 +181,30 @@ export class PcbConnectivityMap {
         if (segment2A.layer !== segment2B.layer) continue
         if (segment1A.layer !== segment2A.layer) continue
 
+        // The legacy constant-width predicate cannot represent explicit tapers.
+        if (
+          segment1A.width_interpolation_mode ||
+          segment2A.width_interpolation_mode
+        ) {
+          const polygon1 = getWireSegmentPolygon(
+            segment1A,
+            segment1B,
+            trace1.route_thickness_mode === "interpolated"
+              ? segment1B.width
+              : segment1A.width,
+          ).scale(GEOMETRY_SCALE, GEOMETRY_SCALE)
+          const polygon2 = getWireSegmentPolygon(
+            segment2A,
+            segment2B,
+            trace2.route_thickness_mode === "interpolated"
+              ? segment2B.width
+              : segment2A.width,
+          ).scale(GEOMETRY_SCALE, GEOMETRY_SCALE)
+          if (copperPolygonsTouch(polygon1, polygon2, CONTACT_TOLERANCE))
+            return true
+          continue
+        }
+
         // Reject distant pairs before the unchanged continuous predicate.
         const lineThickness = (segment1A.width + segment2A.width) / 2
         const expansion = Math.max(0, lineThickness) + 1e-9
@@ -318,6 +343,12 @@ export class PcbConnectivityMap {
     )
     const vias = circuitJson.filter((e) => e.type === "pcb_via")
     const board = circuitJson.find((e) => e.type === "pcb_board")
+    const viaLayers = new Map(
+      vias.map((via) => [
+        via.pcb_via_id,
+        getPcbViaSpanLayers(via, board?.num_layers ?? 2),
+      ]),
+    )
 
     for (const pour of pours) {
       if (!pour.source_net_id) continue // Unassigned decorative copper has no target net to validate.
@@ -368,7 +399,7 @@ export class PcbConnectivityMap {
               element.outer_diameter,
               element.hole_diameter,
             ),
-            layers: element.layers,
+            layers: viaLayers.get(element.pcb_via_id)!,
             netId,
             isTerminal: true,
             viaId: element.pcb_via_id,
@@ -384,8 +415,10 @@ export class PcbConnectivityMap {
               (via) =>
                 via.x === routePoint.x &&
                 via.y === routePoint.y &&
-                via.layers.includes(routePoint.from_layer) &&
-                via.layers.includes(routePoint.to_layer),
+                viaLayers
+                  .get(via.pcb_via_id)!
+                  .includes(routePoint.from_layer) &&
+                viaLayers.get(via.pcb_via_id)!.includes(routePoint.to_layer),
             )
             add({
               polygon: getViaPolygon(
@@ -400,7 +433,7 @@ export class PcbConnectivityMap {
                   0.2,
               ),
               layers:
-                actualVia?.layers ??
+                (actualVia ? viaLayers.get(actualVia.pcb_via_id) : undefined) ??
                 getViaSpanLayers({
                   fromLayer: routePoint.from_layer,
                   toLayer: routePoint.to_layer,
@@ -429,12 +462,15 @@ export class PcbConnectivityMap {
               ? next.width
               : startWidth
           add({
-            polygon: getTraceSegmentPolygon(
-              start.point,
-              end.point,
-              startWidth,
-              endWidth,
-            ),
+            polygon:
+              routePoint.route_type === "wire"
+                ? getWireSegmentPolygon(routePoint, end.point, endWidth)
+                : getTraceSegmentPolygon(
+                    start.point,
+                    end.point,
+                    startWidth,
+                    endWidth,
+                  ),
             layers: [start.layer],
             netId,
             isTerminal: false,
