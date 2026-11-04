@@ -28,8 +28,13 @@ export class ConnectivityMap {
       let targetNetId: string
 
       if (existingNets.size === 0) {
-        // If no existing nets found, create a new one
-        targetNetId = `connectivity_net${Object.keys(this.netMap).length}`
+        // Network IDs can be sparse after merging. Never overwrite a live net
+        // or an alias retained for callers that still hold its ID.
+        let nextNetIndex = Object.keys(this.netMap).length
+        targetNetId = `connectivity_net${nextNetIndex}`
+        while (Object.hasOwn(this.netMap, targetNetId)) {
+          targetNetId = `connectivity_net${++nextNetIndex}`
+        }
         this.netMap[targetNetId] = []
       } else if (existingNets.size === 1) {
         // If only one existing net found, use it

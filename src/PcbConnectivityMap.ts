@@ -1,7 +1,90 @@
-import type { AnyCircuitElement, PCBPort, PCBTrace } from "circuit-json"
+import type { Polygon } from "@flatten-js/core"
+import type {
+  AnyCircuitElement,
+  PCBPort,
+  PCBTrace,
+  LayerRef,
+  PcbTraceRoutePoint,
+  PcbTraceRoutePointWire,
+} from "circuit-json"
+import Flatbush from "flatbush"
+import {
+  copperPolygonsTouch,
+  getPlatedHolePolygon,
+  getPourPolygon,
+  getSmtPadPolygon,
+  getTraceSegmentPolygon,
+  getViaPolygon,
+} from "@tscircuit/circuit-json-util"
+import { getFullConnectivityMapFromCircuitJson } from "./getFullConnectivityMapFromCircuitJson"
+import { getPcbViaSpanLayers, getViaSpanLayers } from "./getViaSpanLayers"
+import { getWireSegmentPolygon } from "./getWireSegmentPolygon"
 import { ConnectivityMap } from "./ConnectivityMap"
 import { doesLineIntersectLine } from "@tscircuit/math-utils"
 import { findConnectedNetworks } from "./findConnectedNetworks"
+import { projectCopperConductorComponents } from "./projectCopperConductorComponents"
+
+// Match the pour solver's coordinate scale. Flatten's internal epsilon must
+// not collapse the sub-micron edges emitted by polygon clipping into points.
+const GEOMETRY_SCALE = 1e6
+const CONTACT_TOLERANCE = 1e-7 * GEOMETRY_SCALE
+
+type TraceSegmentPolygonCache = Map<PCBTrace, Map<number, Polygon>>
+
+const getMaxWireSegmentWidth = (
+  trace: PCBTrace,
+  start: PcbTraceRoutePointWire,
+  end: PcbTraceRoutePointWire,
+) => {
+  const endWidth =
+    trace.route_thickness_mode === "interpolated" ? end.width : start.width
+  return start.width_interpolation_mode
+    ? Math.max(start.start_width ?? start.width, start.end_width ?? endWidth)
+    : Math.max(start.width, endWidth)
+}
+
+const getCachedWirePolygon = (
+  cache: TraceSegmentPolygonCache,
+  trace: PCBTrace,
+  index: number,
+  start: PcbTraceRoutePointWire,
+  end: PcbTraceRoutePointWire,
+): Polygon => {
+  let segments = cache.get(trace)
+  if (!segments) {
+    segments = new Map()
+    cache.set(trace, segments)
+  }
+  let polygon = segments.get(index)
+  if (!polygon) {
+    polygon = getWireSegmentPolygon(
+      start,
+      end,
+      trace.route_thickness_mode === "interpolated" ? end.width : start.width,
+    ).scale(GEOMETRY_SCALE, GEOMETRY_SCALE)
+    segments.set(index, polygon)
+  }
+  return polygon
+}
+
+export interface CopperConductor {
+  layers: LayerRef[]
+  netId: string
+  isTerminal: boolean
+  pourId?: string
+  pcbPortIds?: string[]
+  viaId?: string
+  traceId?: string
+}
+
+interface CopperConductorGeometry extends CopperConductor {
+  polygon: Polygon
+}
+
+interface CopperAnalysis {
+  components: CopperConductorGeometry[][]
+  analyzedTraceIds: Set<string>
+}
 
 /**
  * A PCB Connectivity Map is a connectivity map that has analyzed what traces and ports are actually connected on the
@@ -15,6 +98,7 @@ export class PcbConnectivityMap {
   traceIdToElm: Map<string, PCBTrace>
   portIdToElm: Map<string, PCBPort>
   connMap: ConnectivityMap
+  private copperAnalysis?: CopperAnalysis
 
   constructor(circuitJson?: AnyCircuitElement[]) {
     this.circuitJson = circuitJson || []
@@ -47,37 +131,77 @@ export class PcbConnectivityMap {
 
   private _buildTraceConnectivityMap(): ConnectivityMap {
     const connections: string[][] = []
-    const traceIds = Array.from(this.traceIdToElm.keys())
+    const { components, analyzedTraceIds } = this._getCopperAnalysis()
+    const { connections: copperConnections, ownedIds } =
+      projectCopperConductorComponents(
+        components,
+        analyzedTraceIds,
+        this.traceIdToElm,
+      )
+    // Copper components are authoritative for the IDs they own. The legacy
+    // trace-only model applies exclusively outside that analysis.
+    const traceIds = Array.from(this.traceIdToElm.keys()).filter(
+      (id) => !ownedIds.has(id),
+    )
+    // Keep geometry local to this build so trace edits cannot reuse old polygons.
+    const segmentPolygons: TraceSegmentPolygonCache = new Map()
 
     for (let i = 0; i < traceIds.length; i++) {
       for (let j = i + 1; j < traceIds.length; j++) {
         const trace1 = this.traceIdToElm.get(traceIds[i])!
         const trace2 = this.traceIdToElm.get(traceIds[j])!
-        if (this._arePcbTracesConnected(trace1, trace2)) {
+        if (
+          this._arePcbTracesConnectedWithCache(trace1, trace2, segmentPolygons)
+        ) {
           connections.push([traceIds[i], traceIds[j]])
         }
       }
     }
 
-    for (const port of this.portIdToElm.values()) {
-      for (const trace of this.traceIdToElm.values()) {
-        for (const rp of trace.route) {
-          if (rp.route_type === "wire") {
-            if (rp.start_pcb_port_id === port.pcb_port_id) {
-              connections.push([port.pcb_port_id, trace.pcb_trace_id])
-            } else if (rp.end_pcb_port_id === port.pcb_port_id) {
-              connections.push([trace.pcb_trace_id, port.pcb_port_id])
-            }
+    for (const traceId of traceIds) {
+      const trace = this.traceIdToElm.get(traceId)!
+      for (const rp of trace.route) {
+        if (rp.route_type === "wire") {
+          if (rp.start_pcb_port_id && !ownedIds.has(rp.start_pcb_port_id)) {
+            connections.push([rp.start_pcb_port_id, traceId])
+          }
+          if (rp.end_pcb_port_id && !ownedIds.has(rp.end_pcb_port_id)) {
+            connections.push([traceId, rp.end_pcb_port_id])
           }
         }
       }
     }
 
+    connections.push(...copperConnections)
     return new ConnectivityMap(findConnectedNetworks(connections))
   }
 
   addTrace(trace: PCBTrace) {
+    const isReplacement = this.traceIdToElm.has(trace.pcb_trace_id)
     this.traceIdToElm.set(trace.pcb_trace_id, trace)
+    this.circuitJson = [
+      ...this.circuitJson.filter(
+        (element) =>
+          element.type !== "pcb_trace" ||
+          element.pcb_trace_id !== trace.pcb_trace_id,
+      ),
+      trace,
+    ]
+    this.copperAnalysis = undefined
+    // Copper edits can split or merge components and change logical eligibility.
+    // Re-project the complete analysis instead of retaining whole-trace edges.
+    if (
+      isReplacement ||
+      this.circuitJson.some(
+        (element) =>
+          element.type === "pcb_copper_pour" && element.source_net_id,
+      )
+    ) {
+      this.connMap = this._buildTraceConnectivityMap()
+      return
+    }
+
+    // Preserve the lightweight trace-only path for circuits without assigned pours.
     const connections: string[][] = []
     for (const rp of trace.route) {
       if (rp.route_type === "wire") {
@@ -89,11 +213,18 @@ export class PcbConnectivityMap {
         }
       }
     }
-
     this.connMap.addConnections(connections)
   }
 
   _arePcbTracesConnected(trace1: PCBTrace, trace2: PCBTrace): boolean {
+    return this._arePcbTracesConnectedWithCache(trace1, trace2, new Map())
+  }
+
+  private _arePcbTracesConnectedWithCache(
+    trace1: PCBTrace,
+    trace2: PCBTrace,
+    segmentPolygons: TraceSegmentPolygonCache,
+  ): boolean {
     for (let i = 0; i < trace1.route.length - 1; i++) {
       const segment1A = trace1.route[i]
       const segment1B = trace1.route[i + 1]
@@ -118,22 +249,55 @@ export class PcbConnectivityMap {
         if (segment2A.layer !== segment2B.layer) continue
         if (segment1A.layer !== segment2A.layer) continue
 
-        // Reject distant pairs before the unchanged continuous predicate.
+        const hasVariableWidth =
+          !!segment1A.width_interpolation_mode ||
+          !!segment2A.width_interpolation_mode ||
+          trace1.route_thickness_mode === "interpolated" ||
+          trace2.route_thickness_mode === "interpolated"
         const lineThickness = (segment1A.width + segment2A.width) / 2
-        const expansion = Math.max(0, lineThickness) + 1e-9
+        // Include both segments' widest ends before rejecting distant pairs.
+        // No polygon geometry is needed until these conservative bounds overlap.
+        const expansion = hasVariableWidth
+          ? (getMaxWireSegmentWidth(trace1, segment1A, segment1B) +
+              getMaxWireSegmentWidth(trace2, segment2A, segment2B)) /
+              2 +
+            CONTACT_TOLERANCE / GEOMETRY_SCALE
+          : Math.max(0, lineThickness) + 1e-9
         if (
           finiteBounds &&
           Number.isFinite(segment2A.x) &&
           Number.isFinite(segment2A.y) &&
           Number.isFinite(segment2B.x) &&
           Number.isFinite(segment2B.y) &&
-          Number.isFinite(lineThickness) &&
+          Number.isFinite(expansion) &&
           (Math.min(segment2A.x, segment2B.x) > maxX + expansion ||
             Math.max(segment2A.x, segment2B.x) < minX - expansion ||
             Math.min(segment2A.y, segment2B.y) > maxY + expansion ||
             Math.max(segment2A.y, segment2B.y) < minY - expansion)
         )
           continue
+
+        // Use the same width geometry as copper components for interpolated
+        // routes and explicit wire profiles; neither is a constant-width line.
+        if (hasVariableWidth) {
+          const polygon1 = getCachedWirePolygon(
+            segmentPolygons,
+            trace1,
+            i,
+            segment1A,
+            segment1B,
+          )
+          const polygon2 = getCachedWirePolygon(
+            segmentPolygons,
+            trace2,
+            j,
+            segment2A,
+            segment2B,
+          )
+          if (copperPolygonsTouch(polygon1, polygon2, CONTACT_TOLERANCE))
+            return true
+          continue
+        }
 
         // Check if lines are overlapping
         const isOverlapping = doesLineIntersectLine(
@@ -173,5 +337,270 @@ export class PcbConnectivityMap {
           .filter((id) => this.traceIdToElm.has(id))
           .map((id) => this.traceIdToElm.get(id) as PCBTrace)
       : []
+  }
+
+  /** Same-net copper groups, including pour, via, and terminal IDs.
+   * Polygon geometry remains internal. Generated stitching vias still conduct
+   * copper, but callers can exclude them from authored terminal anchors.
+   * A trace ID may occur in multiple physical components. Such an ID stays in
+   * this metadata but has no single network in connMap or the trace queries.
+   */
+  getCopperConductorComponents(
+    generatedStitchingViaIds: ReadonlySet<string> = new Set(),
+  ): CopperConductor[][] {
+    return this._getCopperAnalysis().components.map((conductors) =>
+      conductors.map(({ polygon, ...conductor }) => ({
+        ...conductor,
+        isTerminal:
+          conductor.isTerminal &&
+          !(conductor.viaId && generatedStitchingViaIds.has(conductor.viaId)),
+      })),
+    )
+  }
+
+  private _getCopperAnalysis(): CopperAnalysis {
+    return (this.copperAnalysis ??= this._buildCopperAnalysis())
+  }
+
+  /** Physical contacts use board-world points in mm (+X right, +Y up,
+   * +Z toward top, right-handed), scaled internally for robust predicates.
+   * Net membership only permits a contact; it never creates a physical edge.
+   * Trace segments remain separate, and only plated barrels bridge layers.
+   */
+  private _buildCopperAnalysis(): CopperAnalysis {
+    const circuitJson = this.circuitJson
+    const pours = circuitJson.filter((e) => e.type === "pcb_copper_pour")
+    const analyzedTraceIds = new Set<string>()
+    if (pours.length === 0) return { components: [], analyzedTraceIds }
+    const connectivity = getFullConnectivityMapFromCircuitJson(circuitJson)
+    const pouredNets = new Set(
+      pours.flatMap((pour) =>
+        pour.source_net_id
+          ? [
+              connectivity.getNetConnectedToId(pour.source_net_id) ??
+                pour.source_net_id,
+            ]
+          : [],
+      ),
+    )
+    const conductors: CopperConductorGeometry[] = []
+    const add = (conductor: CopperConductorGeometry) => {
+      if (pouredNets.has(conductor.netId) && !conductor.polygon.isEmpty())
+        conductors.push({
+          ...conductor,
+          polygon: conductor.polygon.scale(GEOMETRY_SCALE, GEOMETRY_SCALE),
+        })
+    }
+    const components = new Map(
+      circuitJson
+        .filter((e) => e.type === "pcb_component")
+        .map((e) => [e.pcb_component_id, e]),
+    )
+    const vias = circuitJson.filter((e) => e.type === "pcb_via")
+    const board = circuitJson.find((e) => e.type === "pcb_board")
+    const viaLayers = new Map(
+      vias.map((via) => [
+        via.pcb_via_id,
+        getPcbViaSpanLayers(via, board?.num_layers ?? 2),
+      ]),
+    )
+
+    for (const pour of pours) {
+      if (!pour.source_net_id) continue // Unassigned decorative copper has no target net to validate.
+      add({
+        polygon: getPourPolygon(pour),
+        layers: [pour.layer],
+        netId:
+          connectivity.getNetConnectedToId(pour.source_net_id) ??
+          pour.source_net_id,
+        isTerminal: false,
+        pourId: pour.pcb_copper_pour_id,
+      })
+    }
+    for (const element of circuitJson) {
+      if (element.type === "pcb_smtpad") {
+        const netId = connectivity.getNetConnectedToId(element.pcb_smtpad_id)
+        if (netId && pouredNets.has(netId))
+          add({
+            polygon: getSmtPadPolygon(element),
+            layers: [element.layer],
+            netId,
+            isTerminal: !!element.pcb_port_id,
+            pcbPortIds: element.pcb_port_id ? [element.pcb_port_id] : [],
+          })
+      } else if (element.type === "pcb_plated_hole") {
+        const netId = connectivity.getNetConnectedToId(
+          element.pcb_plated_hole_id,
+        )
+        if (netId && pouredNets.has(netId))
+          add({
+            polygon: getPlatedHolePolygon(
+              element,
+              element.pcb_component_id
+                ? components.get(element.pcb_component_id)?.rotation
+                : 0,
+            ),
+            layers: element.layers,
+            netId,
+            isTerminal: !!element.pcb_port_id,
+            pcbPortIds: element.pcb_port_id ? [element.pcb_port_id] : [],
+          })
+      } else if (element.type === "pcb_via") {
+        const netId = connectivity.getNetConnectedToId(element.pcb_via_id)
+        if (netId && pouredNets.has(netId))
+          add({
+            polygon: getViaPolygon(
+              element,
+              element.outer_diameter,
+              element.hole_diameter,
+            ),
+            layers: viaLayers.get(element.pcb_via_id)!,
+            netId,
+            isTerminal: true,
+            viaId: element.pcb_via_id,
+            pcbPortIds: element.pcb_port_ids,
+          })
+      } else if (element.type === "pcb_trace") {
+        const netId = connectivity.getNetConnectedToId(element.pcb_trace_id)
+        if (!netId || !pouredNets.has(netId)) continue
+        // Eligibility, not emitted geometry, determines ownership. A trace with
+        // no conducting segments must not fall back to endpoint-only edges.
+        analyzedTraceIds.add(element.pcb_trace_id)
+        for (let i = 0; i < element.route.length; i++) {
+          const routePoint = element.route[i]!
+          if (routePoint.route_type === "via") {
+            const actualVia = vias.find(
+              (via) =>
+                via.x === routePoint.x &&
+                via.y === routePoint.y &&
+                viaLayers
+                  .get(via.pcb_via_id)!
+                  .includes(routePoint.from_layer) &&
+                viaLayers.get(via.pcb_via_id)!.includes(routePoint.to_layer),
+            )
+            add({
+              polygon: getViaPolygon(
+                routePoint,
+                actualVia?.outer_diameter ??
+                  routePoint.outer_diameter ??
+                  board?.min_via_pad_diameter ??
+                  0.3,
+                actualVia?.hole_diameter ??
+                  routePoint.hole_diameter ??
+                  board?.min_via_hole_diameter ??
+                  0.2,
+              ),
+              layers:
+                (actualVia ? viaLayers.get(actualVia.pcb_via_id) : undefined) ??
+                getViaSpanLayers({
+                  fromLayer: routePoint.from_layer,
+                  toLayer: routePoint.to_layer,
+                  layerCount: board?.num_layers ?? 2,
+                }),
+              netId,
+              isTerminal: false,
+              traceId: element.pcb_trace_id,
+            })
+          }
+          const next = element.route[i + 1]
+          if (!next) continue
+          const start = this._getRouteEndpoint(routePoint, "end")
+          const end = this._getRouteEndpoint(next, "start")
+          if (start.layer !== end.layer) continue
+          const startWidth =
+            routePoint.route_type === "via"
+              ? next.route_type === "via"
+                ? undefined
+                : next.width
+              : routePoint.width
+          if (startWidth === undefined) continue
+          const endWidth =
+            element.route_thickness_mode === "interpolated" &&
+            next.route_type !== "via"
+              ? next.width
+              : startWidth
+          add({
+            polygon:
+              routePoint.route_type === "wire"
+                ? getWireSegmentPolygon(routePoint, end.point, endWidth)
+                : getTraceSegmentPolygon(
+                    start.point,
+                    end.point,
+                    startWidth,
+                    endWidth,
+                  ),
+            layers: [start.layer],
+            netId,
+            isTerminal: false,
+            traceId: element.pcb_trace_id,
+          })
+        }
+      }
+    }
+
+    if (conductors.length === 0) return { components: [], analyzedTraceIds }
+    const parent = conductors.map((_, i) => i)
+    const find = (i: number): number => {
+      while (parent[i] !== i) {
+        parent[i] = parent[parent[i]!]!
+        i = parent[i]!
+      }
+      return i
+    }
+    const bounds = conductors.map((conductor) => conductor.polygon.box)
+    const spatialIndex = new Flatbush(conductors.length)
+    for (const box of bounds)
+      spatialIndex.add(box.xmin, box.ymin, box.xmax, box.ymax)
+    spatialIndex.finish()
+    for (const [i, conductor] of conductors.entries()) {
+      const box = bounds[i]!
+      for (const j of spatialIndex.search(
+        box.xmin - CONTACT_TOLERANCE,
+        box.ymin - CONTACT_TOLERANCE,
+        box.xmax + CONTACT_TOLERANCE,
+        box.ymax + CONTACT_TOLERANCE,
+      )) {
+        if (j <= i || find(i) === find(j)) continue
+        const neighbor = conductors[j]!
+        if (
+          conductor.netId !== neighbor.netId ||
+          !conductor.layers.some((layer) => neighbor.layers.includes(layer))
+        )
+          continue
+        if (
+          copperPolygonsTouch(
+            conductor.polygon,
+            neighbor.polygon,
+            CONTACT_TOLERANCE,
+          )
+        )
+          parent[find(j)] = find(i)
+      }
+    }
+    const conductorsByRoot = new Map<number, CopperConductorGeometry[]>()
+    for (const [index, conductor] of conductors.entries()) {
+      const root = find(index)
+      const connectedConductors = conductorsByRoot.get(root)
+      if (connectedConductors) connectedConductors.push(conductor)
+      else conductorsByRoot.set(root, [conductor])
+    }
+    return { components: [...conductorsByRoot.values()], analyzedTraceIds }
+  }
+
+  private _getRouteEndpoint(
+    routePoint: PcbTraceRoutePoint,
+    side: "start" | "end",
+  ) {
+    if (routePoint.route_type === "wire")
+      return { point: routePoint, layer: routePoint.layer }
+    if (routePoint.route_type === "via")
+      return {
+        point: routePoint,
+        layer: side === "start" ? routePoint.from_layer : routePoint.to_layer,
+      }
+    return {
+      point: routePoint[side],
+      layer: side === "start" ? routePoint.start_layer : routePoint.end_layer,
+    }
   }
 }
