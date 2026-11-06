@@ -255,3 +255,48 @@ test("PcbConnectivityMap.addTrace should correctly add a new trace and update co
     ]),
   ).toBe(true)
 })
+
+test("PcbConnectivityMap.addTrace connects a trace that overlaps an existing trace without shared port IDs", () => {
+  const pcbConnectivityMap = new PcbConnectivityMap([
+    {
+      type: "pcb_trace",
+      pcb_trace_id: "trace1",
+      route: [
+        {
+          x: 0,
+          y: 0,
+          route_type: "wire",
+          width: 1,
+          layer: "top",
+          start_pcb_port_id: "port1",
+        },
+        { x: 10, y: 0, route_type: "wire", width: 1, layer: "top" },
+      ],
+    },
+    {
+      type: "pcb_port",
+      pcb_port_id: "port1",
+      x: 0,
+      y: 0,
+      source_port_id: "source_port1",
+      pcb_component_id: "component1",
+      layers: ["top"],
+    },
+  ])
+
+  pcbConnectivityMap.addTrace({
+    type: "pcb_trace",
+    pcb_trace_id: "trace2",
+    route: [
+      { x: 5, y: 0, route_type: "wire", width: 1, layer: "top" },
+      { x: 15, y: 0, route_type: "wire", width: 1, layer: "top" },
+    ],
+  })
+
+  expect(pcbConnectivityMap.areTracesConnected("trace1", "trace2")).toBe(true)
+  expect(
+    pcbConnectivityMap
+      .getAllTracesConnectedToPort("port1")
+      .map((trace) => trace.pcb_trace_id),
+  ).toEqual(["trace1", "trace2"])
+})
